@@ -149,6 +149,8 @@ After installation and a restart, Whodunnit is available as an integration:
 
 You can add Whodunnit to as many entities as you like - including multiple entities on the same physical device. Each tracked entity gets its own config entry and its own sensor. Already-tracked entities are automatically hidden from the picker to prevent duplicates.
 
+**Renames and deletions:** If you rename a tracked entity's entity ID, Whodunnit follows the rename automatically - the sensor keeps its own entity ID, settings, and history. If you delete a tracked entity from Home Assistant, its Whodunnit entry (and any virtual device) is removed automatically along with it.
+
 ### Supported Entity Types
 
 The entity picker is filtered to domains that produce meaningful, actionable state changes:
@@ -709,12 +711,27 @@ Home Assistant has some quirks that may affect Whodunnit's accuracy in specific,
 
 **Local Polling Devices (e.g. LocalTuya):** Polling-based integrations take a short time to re-establish their state after HA restarts. Allow approximately 60 seconds after a restart before Whodunnit can reliably track these devices.
 
-**Advanced Tuning:** Advanced users who need to tune Whodunnit for high-load or memory-constrained systems can adjust the constants in `const.py`: `CACHE_TTL` (context cache lifetime, default 120 seconds), `CACHE_MAX_SIZE` (maximum cached contexts, default 200), `CACHE_CLEANUP_INTERVAL` (minimum seconds between cache cleanup passes, default 30), `USER_CACHE_TTL` (user identity cache lifetime, default 300 seconds), and `HISTORY_LOG_SIZE` (history log length, default 25 entries).
+**Advanced Tuning:** Advanced users who need to tune Whodunnit for high-load or memory-constrained systems can adjust the constants in `const.py`: `CACHE_TTL` (context cache lifetime, default 120 seconds), `CACHE_MAX_SIZE` (maximum cached contexts, default 200), `CACHE_CLEANUP_INTERVAL` (minimum seconds between cache cleanup passes, default 30), `USER_CACHE_TTL` (user identity cache lifetime, default 300 seconds), `ATTRIBUTE_CHANGE_THROTTLE` (attribute-only change debounce, default 2 seconds), and `HISTORY_LOG_SIZE` (history log length, default 25 entries).
 
 **Physical vs. Internal Events:** When `source_type` is `device`, the trigger could be either a genuine physical button press or a device-internal firmware event (such as an inching or [auto-off timer](https://github.com/sfox38/time_off)). Home Assistant does not distinguish between these at the context level, so Whodunnit cannot either.
 
 ---
 ## History
+
+### Version 1.4.0
+4 July 2026
+
+* **Target lifecycle:** Whodunnit now follows the entity it tracks. Renaming the tracked entity's entity ID updates the tracker automatically (the sensor keeps its own entity ID, settings, and history), and deleting the tracked entity from Home Assistant removes the Whodunnit entry along with it. Previously the sensor only noticed a missing target at startup and would otherwise keep showing its last state indefinitely.
+
+* **Recorder storage:** The `history_log` and `cache_debug` attributes are no longer written to Home Assistant's recorder database on every state change, which keeps long-term database growth down. Both attributes are still live on the entity, still work in templates and dashboard cards, and `history_log` still persists across restarts.
+
+* **Performance:** Each sensor's entity-registry listener now uses Home Assistant's keyed dispatcher instead of subscribing to every registry event in the system and filtering by hand - the same O(N)-listener cleanup that version 1.3.0 applied to the event-bus listeners.
+
+* **Robustness:** If the sensor platform fails to set up, the shared event listeners are now torn down instead of remaining subscribed with nothing consuming the cache. The internal loaded-entry refcount was removed; the count is now derived directly from the loaded entries, so the two can no longer drift apart.
+
+* **Maintenance:** The attribute-only debounce is now a tunable constant (`ATTRIBUTE_CHANGE_THROTTLE`, default 2 seconds) listed under Advanced Tuning. Removed redundant `None`-alias constants, consolidated the duplicated slug-to-title logic into a shared helper module, renamed private coroutines to Home Assistant's `_async_` convention, and fixed the duplicate-tracker message to say "entity" rather than "device".
+
+* **Testing:** Test suite updated to Home Assistant 2026.7.1. Branch coverage is now measured in CI, and eleven new tests cover target renames and deletion, unknown users, user-cache expiry, corrupt restored history, cache-eviction edge cases, and setup-failure cleanup.
 
 ### Version 1.3.2
 19 June 2026
