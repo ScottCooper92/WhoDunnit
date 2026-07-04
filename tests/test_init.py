@@ -5,7 +5,7 @@ import time
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import EVENT_CALL_SERVICE
 from homeassistant.core import Context, HomeAssistant
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.whodunnit import _get_friendly, async_remove_entry
@@ -13,6 +13,7 @@ from custom_components.whodunnit.const import (
     CACHE_MAX_SIZE,
     CACHE_TTL,
     DOMAIN,
+    STATE_DEVICE,
     STATE_UI,
 )
 
@@ -65,7 +66,7 @@ async def test_setup_initialises_shared_state(
     data = hass.data[DOMAIN]
     assert "context_cache" in data
     assert "user_cache" in data
-    assert data["entry_count"] == 1
+    assert len(data["entries"]) == 1
     assert "listener_unsubs" in data
     assert entry.entry_id in data["entries"]
     assert data["entries"][entry.entry_id]["targets"] == ["switch.test"]
@@ -285,6 +286,81 @@ async def test_service_call_with_user_id_records_ui(
     assert cache[ctx.id]["id"] == "user-123"
 
 
+async def test_service_call_without_user_or_logic_domain_not_cached(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A plain service call (no user, not automation/script/scene) is ignored."""
+    register_target("switch.test")
+    await _setup(hass, make_config_entry("switch.test"))
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    ctx = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {"domain": "light", "service": "turn_on"},
+        context=ctx,
+    )
+    await hass.async_block_till_done()
+    assert ctx.id not in cache
+
+
+async def test_automation_triggered_without_entity_id_not_cached(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A logic-trigger event without an entity_id caches nothing."""
+    register_target("switch.test")
+    await _setup(hass, make_config_entry("switch.test"))
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    ctx = Context()
+    hass.bus.async_fire("automation_triggered", {"name": "Nameless"}, context=ctx)
+    await hass.async_block_till_done()
+    assert ctx.id not in cache
+
+
+async def test_service_call_without_target_falls_back_to_domain_service(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A scene/script call with no entity target caches domain.service."""
+    register_target("switch.test")
+    await _setup(hass, make_config_entry("switch.test"))
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    ctx = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {"domain": "scene", "service": "turn_on"},
+        context=ctx,
+    )
+    await hass.async_block_till_done()
+    assert cache[ctx.id]["id"] == "scene.turn_on"
+    assert cache[ctx.id]["type"] == "scene"
+
+
+async def test_duplicate_service_call_context_keeps_first_entry(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A second service call reusing a cached context does not overwrite it."""
+    register_target("switch.test")
+    await _setup(hass, make_config_entry("switch.test"))
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    ctx = Context()
+    for target in ("script.first", "script.second"):
+        hass.bus.async_fire(
+            EVENT_CALL_SERVICE,
+            {
+                "domain": "script",
+                "service": "turn_on",
+                "service_data": {"entity_id": target},
+            },
+            context=ctx,
+        )
+        await hass.async_block_till_done()
+
+    assert cache[ctx.id]["id"] == "script.first"
+
+
 # --------------------------------------------------------------------------- #
 # Cache cleanup
 # --------------------------------------------------------------------------- #
@@ -380,6 +456,82 @@ async def test_cleanup_enforces_max_size(
 
 
 # --------------------------------------------------------------------------- #
+# Target renames and removal
+# --------------------------------------------------------------------------- #
+
+
+async def test_target_rename_is_followed(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """Renaming the target's entity_id migrates the entry and the sensor."""
+    register_target("switch.test")
+    entry = make_config_entry("switch.test")
+    await _setup(hass, entry)
+
+    ent_reg = er.async_get(hass)
+    sensor_id = ent_reg.async_get_entity_id("sensor", DOMAIN, "switch.test_whodunnit")
+    assert sensor_id is not None
+
+    ent_reg.async_update_entity("switch.test", new_entity_id="switch.renamed")
+    await hass.async_block_till_done()
+
+    # Config entry follows the rename.
+    assert entry.data["targets"] == ["switch.renamed"]
+    assert entry.unique_id == "whodunnit_switch_renamed"
+    # The sensor keeps its entity_id via the migrated unique_id.
+    assert (
+        ent_reg.async_get_entity_id("sensor", DOMAIN, "switch.renamed_whodunnit")
+        == sensor_id
+    )
+
+    # The reloaded sensor listens on the new entity_id.
+    hass.states.async_set("switch.renamed", "off")
+    await hass.async_block_till_done()
+    hass.states.async_set("switch.renamed", "on", context=Context())
+    await hass.async_block_till_done()
+    assert hass.states.get(sensor_id).state == STATE_DEVICE
+
+
+async def test_target_removal_removes_entry(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """Deleting the tracked entity removes the Whodunnit entry and its device."""
+    register_target("input_boolean.test", platform="input_boolean")
+    entry = make_config_entry("input_boolean.test")
+    await _setup(hass, entry)
+
+    dev_reg = dr.async_get(hass)
+    assert dev_reg.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+
+    er.async_get(hass).async_remove("input_boolean.test")
+    await hass.async_block_till_done()
+
+    assert hass.config_entries.async_entries(DOMAIN) == []
+    assert dev_reg.async_get_device(identifiers={(DOMAIN, entry.entry_id)}) is None
+
+
+async def test_forward_setup_failure_unwinds_shared_state(
+    hass: HomeAssistant, make_config_entry, register_target, monkeypatch
+):
+    """A failed platform forward must not leave orphaned shared listeners."""
+    register_target("switch.test")
+    entry = make_config_entry("switch.test")
+    entry.add_to_hass(hass)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("forward failed")
+
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", _boom)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert "entries" not in hass.data[DOMAIN]
+    assert "listener_unsubs" not in hass.data[DOMAIN]
+    assert "context_cache" not in hass.data[DOMAIN]
+
+
+# --------------------------------------------------------------------------- #
 # Unload / remove
 # --------------------------------------------------------------------------- #
 
@@ -396,7 +548,7 @@ async def test_unload_tears_down_shared_state(
 
     assert "context_cache" not in hass.data[DOMAIN]
     assert "listener_unsubs" not in hass.data[DOMAIN]
-    assert hass.data[DOMAIN]["entry_count"] == 0
+    assert "entries" not in hass.data[DOMAIN]
 
 
 async def test_unload_keeps_shared_state_with_other_entries(
@@ -408,14 +560,14 @@ async def test_unload_keeps_shared_state_with_other_entries(
     entry_b = make_config_entry("switch.b")
     await _setup(hass, entry_a)
     await _setup(hass, entry_b)
-    assert hass.data[DOMAIN]["entry_count"] == 2
+    assert len(hass.data[DOMAIN]["entries"]) == 2
 
     assert await hass.config_entries.async_unload(entry_a.entry_id)
     await hass.async_block_till_done()
 
     # Listeners and cache stay alive while entry_b is still loaded.
     assert "context_cache" in hass.data[DOMAIN]
-    assert hass.data[DOMAIN]["entry_count"] == 1
+    assert len(hass.data[DOMAIN]["entries"]) == 1
     assert entry_b.entry_id in hass.data[DOMAIN]["entries"]
 
 

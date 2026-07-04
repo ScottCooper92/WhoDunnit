@@ -10,6 +10,7 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.whodunnit.const import (
+    ATTR_CACHE_DEBUG,
     ATTR_CONFIDENCE,
     ATTR_CONTEXT_ID,
     ATTR_EVENT_TIME,
@@ -26,12 +27,14 @@ from custom_components.whodunnit.const import (
     ID_INDIRECT_AUTOMATION,
     NAME_DEVICE,
     NAME_INDIRECT_AUTOMATION,
+    NAME_UNKNOWN_USER,
     STATE_AUTOMATION,
     STATE_DEVICE,
     STATE_MONITORING,
     STATE_SCRIPT,
     STATE_SERVICE,
     STATE_UI,
+    USER_CACHE_TTL,
 )
 from custom_components.whodunnit.sensor import WhodunnitSensor
 
@@ -193,6 +196,42 @@ async def test_step2_user_id_service_account(
     state = hass.states.get(sid)
     assert state.state == STATE_SERVICE
     assert state.attributes[ATTR_SOURCE_ID] == user.id
+
+
+async def test_unknown_user_id_uses_placeholder_name(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A user_id that resolves to no HA user is reported as Unknown User."""
+    _, sid = await _setup_sensor(hass, make_config_entry, register_target)
+    # A person tied to a different user must be skipped by the person scan.
+    hass.states.async_set("person.bob", "home", {"user_id": "someone-else"})
+
+    await _fire(hass, "switch.test", "on", context=Context(user_id="ghost-user-id"))
+
+    state = hass.states.get(sid)
+    assert state.state == STATE_UI
+    assert state.attributes[ATTR_SOURCE_NAME] == NAME_UNKNOWN_USER
+    assert state.attributes[ATTR_SOURCE_ID] == "ghost-user-id"
+
+
+async def test_user_cache_expiry_picks_up_person_rename(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """An expired user-cache entry re-resolves the person's current name."""
+    _, sid = await _setup_sensor(hass, make_config_entry, register_target)
+    user = await _make_user(hass, "Alice", with_person=True)
+
+    await _fire(hass, "switch.test", "on", context=Context(user_id=user.id))
+    assert _attrs(hass, sid)[ATTR_SOURCE_NAME] == "Alice"
+
+    # Rename the person, then age the cache entry past its TTL.
+    hass.states.async_set(
+        "person.alice", "home", {"user_id": user.id, "friendly_name": "Alicia"}
+    )
+    hass.data[DOMAIN]["user_cache"][user.id]["timestamp"] -= USER_CACHE_TTL + 1
+
+    await _fire(hass, "switch.test", "off", context=Context(user_id=user.id))
+    assert _attrs(hass, sid)[ATTR_SOURCE_NAME] == "Alicia"
 
 
 async def test_step3_parent_in_cache(
@@ -527,6 +566,48 @@ async def test_ignores_unavailable_restored_state(
         State("sensor.restored", "unavailable", {}),
     )
     assert hass.states.get(sid).state == STATE_MONITORING
+
+
+async def test_ignores_corrupt_restored_history_log(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A restored history_log that is not a list is discarded."""
+    sid = await _setup_with_restore(
+        hass, make_config_entry, register_target,
+        State("sensor.restored", STATE_AUTOMATION, {ATTR_HISTORY_LOG: "corrupt"}),
+    )
+    state = hass.states.get(sid)
+    assert state.state == STATE_AUTOMATION
+    assert state.attributes[ATTR_HISTORY_LOG] == []
+
+
+async def test_cache_debug_handles_evicted_matched_entry(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """cache_debug degrades gracefully when the matched entry was evicted."""
+    _, sid = await _setup_sensor(hass, make_config_entry, register_target)
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    ctx = Context()
+    cache[ctx.id] = {
+        "id": "automation.morning",
+        "name": "Morning",
+        "type": STATE_AUTOMATION,
+        "timestamp": time.monotonic(),
+    }
+    await _fire(hass, "switch.test", "on", context=ctx)
+    assert _attrs(hass, sid)[ATTR_CACHE_DEBUG]["matched_entry"]["type"] == (
+        STATE_AUTOMATION
+    )
+
+    # Evict the matched entry, then force a state write via a target rename.
+    del cache[ctx.id]
+    er.async_get(hass).async_update_entity("switch.test", name="Force Write")
+    await hass.async_block_till_done()
+
+    debug = _attrs(hass, sid)[ATTR_CACHE_DEBUG]
+    assert debug["matched_entry"] is None
+    assert debug["last_classification_ago"] is not None
 
 
 # --------------------------------------------------------------------------- #
