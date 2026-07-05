@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # homeassistant 2026.6.2 (pinned in requirements_test.txt) requires
+        # homeassistant 2026.7.1 (pinned in requirements_test.txt) requires
         # Python >=3.14.2, so the runner Python must be 3.14+. Bump this in step
         # with the HA pin.
         python-version: ["3.14"]
