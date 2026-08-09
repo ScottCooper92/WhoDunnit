@@ -1,7 +1,7 @@
 # Whodunnit
 
-[![Tests](https://github.com/sfox38/whodunnit/actions/workflows/tests.yml/badge.svg)](https://github.com/sfox38/whodunnit/actions/workflows/tests.yml)
-[![Validate](https://github.com/sfox38/whodunnit/actions/workflows/validate.yml/badge.svg)](https://github.com/sfox38/whodunnit/actions/workflows/validate.yml)
+[![Tests](https://github.com/ScottCooper92/WhoDunnit/actions/workflows/tests.yml/badge.svg)](https://github.com/ScottCooper92/WhoDunnit/actions/workflows/tests.yml)
+[![Validate](https://github.com/ScottCooper92/WhoDunnit/actions/workflows/validate.yml/badge.svg)](https://github.com/ScottCooper92/WhoDunnit/actions/workflows/validate.yml)
 
 **A Home Assistant Custom Integration - Know exactly what triggered your smart devices.**
 
@@ -126,7 +126,7 @@ Each Whodunnit sensor exposes the following attributes:
 
 1. Open **HACS** in your Home Assistant sidebar.
 2. Click the three-dot menu (top right) and choose **Custom repositories**.
-3. Paste `https://github.com/sfox38/whodunnit` and select **Integration** as the category.
+3. Paste `https://github.com/ScottCooper92/WhoDunnit` and select **Integration** as the category.
 4. Click **Add**, then find **Whodunnit** in the HACS Integration list and click **Download**.
 5. Restart Home Assistant.
 
@@ -189,8 +189,8 @@ Helper entities (template entities, `input_select`, `input_number`, etc.) usuall
 
 A quick look at the Whodunnit sensor on any device's page instantly tells you how the device was last activated. Expand the attributes for the full picture - who, what, when, and how confident the answer is.
 
-<table border="0"><tr><td width="50%" valign="top"><img src="https://raw.githubusercontent.com/sfox38/whodunnit/main/images/sensor.png" width="100%"></td>
-<td width="50%" valign="top"><img src="https://raw.githubusercontent.com/sfox38/whodunnit/main/images/attributes.png" width="100%"></td></tr></table>
+<table border="0"><tr><td width="50%" valign="top"><img src="https://raw.githubusercontent.com/ScottCooper92/WhoDunnit/main/images/sensor.png" width="100%"></td>
+<td width="50%" valign="top"><img src="https://raw.githubusercontent.com/ScottCooper92/WhoDunnit/main/images/attributes.png" width="100%"></td></tr></table>
 
 **Common debugging scenarios:**
 - *"Why did my bedroom light turn on at 3 am?"* - Check `source_name` to see which automation was responsible.
@@ -203,7 +203,7 @@ A quick look at the Whodunnit sensor on any device's page instantly tells you ho
 
 #### Basic Status Card
 <table border="0"><tr><td width="50%" valign="top">This card displays the current trigger source and all its attributes at a glance. Paste the entire block into your dashboard as a new card, and change only the entity ID on the `&target` line.</td>
-<td width="50%" valign="top"><img src="https://raw.githubusercontent.com/sfox38/whodunnit/main/images/sensorcard.png" width="100%"></td></tr></table>
+<td width="50%" valign="top"><img src="https://raw.githubusercontent.com/ScottCooper92/WhoDunnit/main/images/sensorcard.png" width="100%"></td></tr></table>
 
 
 ```yaml
@@ -262,7 +262,7 @@ entities:
 
 Change only the `entity_id` variable on the first line of the `content` block.
 </td>
-<td width="50%" valign="top"><img src="https://raw.githubusercontent.com/sfox38/whodunnit/main/images/historycard.png"></td>
+<td width="50%" valign="top"><img src="https://raw.githubusercontent.com/ScottCooper92/WhoDunnit/main/images/historycard.png"></td>
 </tr></table>
 
 ```yaml
