@@ -42,9 +42,11 @@ Detection cascade (in _async_classify):
                                               echoing its own achieved state back
                                               after an HA command). The command-
                                               echo guard reports HIGH for a genuine
-                                              press but LOW when the context-free
-                                              change lands within COMMAND_ECHO_WINDOW
-                                              of the last HA command to this entity.
+                                              press but LOW while a report train is
+                                              running: within COMMAND_ECHO_WINDOW of
+                                              the command or the previous echo, and
+                                              never beyond COMMAND_ECHO_MAX_WINDOW
+                                              from the command itself.
 
 After every successful classification, Whodunnit fires a "whodunnit_trigger_detected"
 event on the HA event bus (see EVENT_TRIGGER_DETECTED in const.py). This gives
@@ -87,6 +89,7 @@ from .const import (
     ATTR_CONFIDENCE,
     ATTR_HISTORY_LOG,
     ATTRIBUTE_CHANGE_THROTTLE,
+    COMMAND_ECHO_MAX_WINDOW,
     COMMAND_ECHO_WINDOW,
     CONFIDENCE_HIGH,
     CONFIDENCE_MEDIUM,
@@ -188,6 +191,10 @@ class _Classification:
     # The cache key that produced this result (ctx.id for a direct hit,
     # ctx.parent_id for a parent hit), or None when nothing matched.
     matched_context_id: str | None
+    # True when the command-echo guard judged this a device report trailing an
+    # HA command rather than a genuine press. Lets _handle_change extend the
+    # echo chain without having to infer it from (state, confidence).
+    is_echo: bool = False
 
 
 async def async_setup_entry(
@@ -270,8 +277,14 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         # Monotonic time of the last HA-originated command to this entity
         # (automation / ui / scene / script / service). 0.0 = none seen yet.
         # Used by the Step 4 command-echo guard to down-weight an integration's
-        # context-free state echo that trails a command it already made.
+        # context-free state echo that trails a command it already made, and to
+        # anchor COMMAND_ECHO_MAX_WINDOW.
         self._last_command_time = 0.0
+
+        # Monotonic time of the last change the guard judged to be an echo.
+        # Bridges the ~2 s gaps within one report train; reset by each new
+        # command so a fresh command always starts a fresh chain.
+        self._last_echo_time = 0.0
 
         self._is_bleed = False
         self._change_lock = asyncio.Lock()
@@ -480,9 +493,13 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             # of that command arriving moments later (Step 4) is recognised and
             # down-weighted. Only genuine commands count: STATE_DEVICE is itself
             # a press-or-echo (never a command) and STATE_MONITORING is the idle
-            # placeholder.
+            # placeholder. A new command also clears the echo chain so the next
+            # train is measured from this command, not the previous one's tail.
             if result.state not in (STATE_DEVICE, STATE_MONITORING):
                 self._last_command_time = now
+                self._last_echo_time = 0.0
+            elif result.is_echo:
+                self._last_echo_time = now
 
             self._history_log.appendleft({
                 ATTR_EVENT_TIME: self._event_time,
@@ -612,9 +629,15 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         # genuine press: a context-free change within COMMAND_ECHO_WINDOW of the
         # last HA command to this entity is a probable echo, reported low so a
         # consumer can filter it, while a real press stays high.
+        # A report train is bridged by COMMAND_ECHO_WINDOW (gap since the
+        # command or the previous echo) but can never outlive
+        # COMMAND_ECHO_MAX_WINDOW measured from the command itself.
         is_echo = (
             self._last_command_time != 0.0
-            and (now - self._last_command_time) < COMMAND_ECHO_WINDOW
+            and (now - self._last_command_time) < COMMAND_ECHO_MAX_WINDOW
+            and (
+                now - max(self._last_command_time, self._last_echo_time)
+            ) < COMMAND_ECHO_WINDOW
         )
         return _Classification(
             state=STATE_DEVICE,
@@ -623,6 +646,7 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             source_name=NAME_DEVICE,
             confidence=CONFIDENCE_LOW if is_echo else CONFIDENCE_HIGH,
             matched_context_id=None,
+            is_echo=is_echo,
         )
 
     def _build_cache_debug(self) -> dict[str, Any]:
