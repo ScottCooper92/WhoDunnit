@@ -3,6 +3,7 @@
 import time
 
 from homeassistant.core import Context, HomeAssistant, State
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import (
     async_capture_events,
@@ -372,6 +373,45 @@ async def test_echo_after_command_is_low_end_to_end(
     state = hass.states.get(sid)
     assert state.state == STATE_DEVICE
     assert state.attributes[ATTR_CONFIDENCE] == CONFIDENCE_LOW
+
+
+async def test_device_echo_does_not_refresh_command_window(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """An echo must not extend the guard window: only HA commands arm it.
+
+    A Matter transition streams several context-free echoes; if each one
+    refreshed _last_command_time, an echo chain would keep its own window
+    open indefinitely and a genuine press long after the command would still
+    read low. Device classifications must leave the recorded time untouched.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter", state="off",
+    )
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    ctx = Context()
+    cache[ctx.id] = {
+        "id": "automation.dim",
+        "name": "Dim",
+        "type": STATE_AUTOMATION,
+        "timestamp": time.monotonic(),
+    }
+    await _fire(hass, "light.matter", "on", context=ctx)
+
+    sensor = next(
+        p.entities[sid]
+        for p in entity_platform.async_get_platforms(hass, DOMAIN)
+        if sid in p.entities
+    )
+    armed_at = sensor._last_command_time
+    assert armed_at > 0.0  # the automation command armed the guard
+
+    # A trailing echo classifies device/low and must not re-arm the window.
+    await _fire(hass, "light.matter", "off", context=Context())
+    assert _attrs(hass, sid)[ATTR_CONFIDENCE] == CONFIDENCE_LOW
+    assert sensor._last_command_time == armed_at
 
 
 # --------------------------------------------------------------------------- #
