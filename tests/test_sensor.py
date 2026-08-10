@@ -19,6 +19,7 @@ from custom_components.whodunnit.const import (
     ATTR_SOURCE_NAME,
     ATTR_SOURCE_TYPE,
     ATTR_USER_ID,
+    COMMAND_ECHO_WINDOW,
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
     CONFIDENCE_MEDIUM,
@@ -299,6 +300,78 @@ async def test_bleed_platform_downgrades_repeat_ui_hit(
     # Second hit reusing the same context -> bleed suspected -> low.
     await _fire(hass, "switch.esp", "off", context=ctx)
     assert _attrs(hass, sid)[ATTR_CONFIDENCE] == CONFIDENCE_LOW
+
+
+# --------------------------------------------------------------------------- #
+# Command-echo guard (Matter / push integrations)
+# --------------------------------------------------------------------------- #
+
+
+async def test_echo_guard_downgrades_change_soon_after_command():
+    """A context-free change within the echo window of a command is low."""
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    now = time.monotonic()
+    sensor._last_command_time = now - 1.0  # HA commanded this entity 1s ago
+
+    result = await sensor._async_classify(Context(), now)
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_LOW
+
+
+async def test_echo_guard_allows_genuine_press_after_window():
+    """A context-free change once the window has passed is a real press (high)."""
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    now = time.monotonic()
+    sensor._last_command_time = now - (COMMAND_ECHO_WINDOW + 1)
+
+    result = await sensor._async_classify(Context(), now)
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_HIGH
+
+
+async def test_echo_guard_high_when_no_prior_command():
+    """With no command ever recorded, a device change is a genuine press."""
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+
+    result = await sensor._async_classify(Context(), time.monotonic())
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_HIGH
+
+
+async def test_echo_after_command_is_low_end_to_end(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A command records the time; a trailing context-free change reads low.
+
+    Exercises the full pipeline: _async_handle_change records the command time
+    on the automation classification, and the following context-free change is
+    down-weighted by the Step 4 guard - the exact Matter echo pattern.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter", state="off",
+    )
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    ctx = Context()
+    cache[ctx.id] = {
+        "id": "automation.dim",
+        "name": "Dim",
+        "type": STATE_AUTOMATION,
+        "timestamp": time.monotonic(),
+    }
+    # Automation commands the light on -> classified automation, command time set.
+    await _fire(hass, "light.matter", "on", context=ctx)
+    assert hass.states.get(sid).state == STATE_AUTOMATION
+
+    # The Matter node reports a context-free change moments later -> probable echo.
+    await _fire(hass, "light.matter", "off", context=Context())
+    state = hass.states.get(sid)
+    assert state.state == STATE_DEVICE
+    assert state.attributes[ATTR_CONFIDENCE] == CONFIDENCE_LOW
 
 
 # --------------------------------------------------------------------------- #
