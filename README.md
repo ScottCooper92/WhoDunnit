@@ -96,4 +96,4 @@ Include the version of Whodunnit, the version of Home Assistant, the domain and 
 
 ## Licence
 
-Refer to [LICENSE](LICENSE).
+Refer to [LICENSE](https://github.com/ScottCooper92/WhoDunnit/blob/main/LICENSE).
