@@ -4,8 +4,10 @@ name: Validate
 #  - hassfest: Home Assistant's official manifest/integration checker
 #  - HACS:     verifies the repo meets HACS publishing requirements
 # The daily schedule catches breakage when the upstream actions or their
-# requirements change, even without a push.
+# requirements change, even without a push. workflow_dispatch also allows a
+# manual run from the Actions tab or `gh workflow run validate.yml`.
 on:
+  workflow_dispatch:
   push:
   pull_request:
   schedule:

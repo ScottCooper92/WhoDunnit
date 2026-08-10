@@ -4,7 +4,10 @@ name: Tests
 # trigger a run, replace `push:` below with e.g.
 #   push:
 #     branches: [main, dev]
+# workflow_dispatch also allows a manual run from the Actions tab or
+# `gh workflow run tests.yml`.
 on:
+  workflow_dispatch:
   push:
   pull_request:
 
