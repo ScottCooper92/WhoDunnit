@@ -112,6 +112,20 @@ USER_CACHE_TTL = 300
 # entity. Debounces bursts such as a brightness slider being dragged.
 ATTRIBUTE_CHANGE_THROTTLE = 2.0
 
+# Command-echo guard (Step 4 of the detection cascade).
+# Some integrations report their *achieved* state back after an HA command
+# instead of trusting the command optimistically - Matter especially, but any
+# push / state-topic integration can - and stream one update per step while a
+# transition runs. Those reports carry no context, so without a guard they are
+# indistinguishable from a genuine physical press and classify as STATE_DEVICE
+# at high confidence, firing false "manual" signals on the automation's own
+# echo. When a context-free change lands within this many seconds of the last
+# HA-originated command to the same entity, it is treated as a probable echo
+# and reported at CONFIDENCE_LOW (mirroring the ESPHome bleed handling), so a
+# consumer can filter it out while a real press - one with no recent command -
+# still reports high. Sized to cover a typical light transition (<= a few s).
+COMMAND_ECHO_WINDOW = 8.0
+
 # All valid sensor state slugs, used for restored-state validation.
 VALID_STATES = frozenset({
     STATE_MONITORING, STATE_AUTOMATION, STATE_DEVICE,

@@ -37,7 +37,14 @@ Detection cascade (in _async_classify):
                                               entity is resolved to the script).
                                               If parent also missing: MEDIUM confidence,
                                               HA was involved but source unknown.
-  4. Context has no user_id or parent_id   -> Device internal (timer, hardware event)
+  4. Context has no user_id or parent_id   -> Device-originated (physical press,
+                                              hardware event, or an integration
+                                              echoing its own achieved state back
+                                              after an HA command). The command-
+                                              echo guard reports HIGH for a genuine
+                                              press but LOW when the context-free
+                                              change lands within COMMAND_ECHO_WINDOW
+                                              of the last HA command to this entity.
 
 After every successful classification, Whodunnit fires a "whodunnit_trigger_detected"
 event on the HA event bus (see EVENT_TRIGGER_DETECTED in const.py). This gives
@@ -80,6 +87,7 @@ from .const import (
     ATTR_CONFIDENCE,
     ATTR_HISTORY_LOG,
     ATTRIBUTE_CHANGE_THROTTLE,
+    COMMAND_ECHO_WINDOW,
     CONFIDENCE_HIGH,
     CONFIDENCE_MEDIUM,
     CONFIDENCE_LOW,
@@ -258,6 +266,12 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         self._last_attr_time = 0.0
         self._last_classification_time = 0.0
         self._last_matched_context_id: str | None = None
+
+        # Monotonic time of the last HA-originated command to this entity
+        # (automation / ui / scene / script / service). 0.0 = none seen yet.
+        # Used by the Step 4 command-echo guard to down-weight an integration's
+        # context-free state echo that trails a command it already made.
+        self._last_command_time = 0.0
 
         self._is_bleed = False
         self._change_lock = asyncio.Lock()
@@ -440,7 +454,7 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             # cache-dict logic. Scope the catch tightly so a genuine bug is
             # not silently swallowed.
             try:
-                result = await self._async_classify(ctx)
+                result = await self._async_classify(ctx, now)
             except Exception:
                 _LOGGER.exception(
                     "Whodunnit: error classifying %s", self._target_entity
@@ -461,6 +475,14 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             )
             self._last_classification_time = now
             self._last_matched_context_id = result.matched_context_id
+
+            # Remember when HA last commanded this entity, so a context-free echo
+            # of that command arriving moments later (Step 4) is recognised and
+            # down-weighted. Only genuine commands count: STATE_DEVICE is itself
+            # a press-or-echo (never a command) and STATE_MONITORING is the idle
+            # placeholder.
+            if result.state not in (STATE_DEVICE, STATE_MONITORING):
+                self._last_command_time = now
 
             self._history_log.appendleft({
                 ATTR_EVENT_TIME: self._event_time,
@@ -487,14 +509,17 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
                 },
             )
 
-    async def _async_classify(self, ctx: Context | None) -> _Classification:
+    async def _async_classify(
+        self, ctx: Context | None, now: float
+    ) -> _Classification:
         """Decide what triggered the change. No side effects on entity state.
 
         Walks the detection cascade documented at the top of this module and
         returns a _Classification. The only external dependency is the person/
         auth lookup in steps 1 and 2; everything else is cache-dict logic. The
         shared cache entry's "seen" flag is updated here as part of ESPHome
-        bleed detection.
+        bleed detection. ``now`` is the caller's monotonic timestamp for the
+        change, used by the Step 4 command-echo guard.
         """
         # Step 1: Direct cache hit on the context ID.
         owner = self._cache.get(ctx.id) if ctx else None
@@ -580,13 +605,23 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
                 matched_context_id=None,
             )
 
-        # Step 4: No user, no parent, no cache hit. Device-originated.
+        # Step 4: No user, no parent, no cache hit. Device-originated - a
+        # physical press, a hardware event, or an integration echoing its own
+        # achieved state back after an HA command (Matter, push/state-topic
+        # integrations). The command-echo guard separates the last case from a
+        # genuine press: a context-free change within COMMAND_ECHO_WINDOW of the
+        # last HA command to this entity is a probable echo, reported low so a
+        # consumer can filter it, while a real press stays high.
+        is_echo = (
+            self._last_command_time != 0.0
+            and (now - self._last_command_time) < COMMAND_ECHO_WINDOW
+        )
         return _Classification(
             state=STATE_DEVICE,
             source_type=SOURCE_TYPE_DEVICE,
             source_id=self._target_entity,
             source_name=NAME_DEVICE,
-            confidence=CONFIDENCE_HIGH,
+            confidence=CONFIDENCE_LOW if is_echo else CONFIDENCE_HIGH,
             matched_context_id=None,
         )
 
