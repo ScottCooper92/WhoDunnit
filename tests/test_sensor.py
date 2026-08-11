@@ -312,7 +312,7 @@ async def test_bleed_platform_downgrades_repeat_ui_hit(
 
 async def test_echo_guard_downgrades_change_soon_after_command():
     """A context-free change within the echo window of a command is low."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - 1.0  # HA commanded this entity 1s ago
 
@@ -324,7 +324,7 @@ async def test_echo_guard_downgrades_change_soon_after_command():
 
 async def test_echo_guard_allows_genuine_press_after_window():
     """A context-free change once the window has passed is a real press (high)."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - (COMMAND_ECHO_WINDOW + 1)
 
@@ -336,7 +336,7 @@ async def test_echo_guard_allows_genuine_press_after_window():
 
 async def test_echo_guard_high_when_no_prior_command():
     """With no command ever recorded, a device change is a genuine press."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
 
     result = await sensor._async_classify(Context(), time.monotonic())
 
@@ -424,7 +424,7 @@ async def test_echo_chain_bridges_consecutive_reports():
     Reports arrive ~2s apart and can run well beyond COMMAND_ECHO_WINDOW from
     the command; each echo extends the chain so the whole train reads low.
     """
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     # Command is older than the gap window, but a report landed 2s ago.
     sensor._last_command_time = now - (COMMAND_ECHO_WINDOW + 4)
@@ -439,7 +439,7 @@ async def test_echo_chain_bridges_consecutive_reports():
 
 async def test_echo_chain_cannot_outlive_max_window():
     """The ceiling wins even while a chain is still being extended."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - (COMMAND_ECHO_MAX_WINDOW + 1)
     sensor._last_echo_time = now - 2.0  # chain still live
@@ -453,7 +453,7 @@ async def test_echo_chain_cannot_outlive_max_window():
 
 async def test_echo_chain_closes_once_reports_stop():
     """Once the train goes quiet the guard re-arms, well inside the ceiling."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - 20.0  # still under the 30s ceiling
     sensor._last_echo_time = now - (COMMAND_ECHO_WINDOW + 1)
@@ -544,9 +544,80 @@ def test_command_match_ignores_a_stale_command():
 
 def test_command_match_none_without_a_recorded_command():
     """With nothing recorded the caller falls back to the time guard."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     verdict = sensor._command_echo_verdict(
         time.monotonic(), _light_state(brightness=200), None
+    )
+    assert verdict is None
+
+
+async def test_plain_turn_on_does_not_swallow_a_later_press():
+    """A record of nothing but "we asked for on" is too thin to rule on.
+
+    `light.turn_on` with neither brightness nor colour is the most common light
+    call there is, and every later report of a lit light satisfies it - a manual
+    dim included. Judging that a match would swallow presses for the whole
+    ceiling, so the value comparison must abstain and let the guard answer.
+    """
+    sensor = _sensor_with_command()  # state on, nothing numeric recorded
+    now = time.monotonic()
+    sensor._last_command_time = now - 20.0  # any train is long over
+
+    verdict = sensor._command_echo_verdict(
+        now, _light_state(brightness=30), _light_state(brightness=200)
+    )
+    assert verdict is None
+
+    result = await sensor._async_classify(Context(), now, verdict)
+    assert result.confidence == CONFIDENCE_HIGH
+
+
+async def test_toggle_evicts_the_stale_command_record(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """An unhandled light service must not leave a record asserting the opposite.
+
+    `light.toggle` turns the light off while the cache still says "we asked for
+    on", so the toggle's own echo would be ruled a manual press - the false
+    signal the guard exists to avoid. Evicting leaves the guard to decide.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter",
+        state="on", attributes={"brightness": 200},
+    )
+    command_cache = hass.data[DOMAIN]["command_cache"]
+
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness": 250},
+        },
+    )
+    await hass.async_block_till_done()
+    assert "light.matter" in command_cache
+
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "toggle",
+            "service_data": {"entity_id": "light.matter"},
+        },
+    )
+    await hass.async_block_till_done()
+    assert "light.matter" not in command_cache
+
+    # With the record gone, the toggle's echo cannot be ruled a person.
+    sensor = next(
+        p.entities[sid]
+        for p in entity_platform.async_get_platforms(hass, DOMAIN)
+        if sid in p.entities
+    )
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(state="off"), _light_state(brightness=200)
     )
     assert verdict is None
 
@@ -1031,7 +1102,7 @@ async def test_cache_debug_handles_evicted_matched_entry(
 
 
 def test_build_cache_debug_before_any_classification():
-    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {}, {})
     debug = sensor._build_cache_debug()
     assert debug == {
         "last_classification_ago": None,
@@ -1041,7 +1112,7 @@ def test_build_cache_debug_before_any_classification():
 
 
 def test_clean_target_name_strips_device_prefix(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {}, {})
     sensor.hass = hass
     hass.states.async_set(
         "switch.lamp", "on", {"friendly_name": "Living Room Lamp"}
@@ -1050,7 +1121,7 @@ def test_clean_target_name_strips_device_prefix(hass: HomeAssistant):
 
 
 def test_clean_target_name_prefers_registry_name(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {}, {})
     sensor.hass = hass
     ent_reg = er.async_get(hass)
     ent_reg.async_get_or_create(
@@ -1062,7 +1133,7 @@ def test_clean_target_name_prefers_registry_name(hass: HomeAssistant):
 
 
 def test_clean_target_name_without_prefix(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Garage"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Garage"}, {}, {}, {})
     sensor.hass = hass
     hass.states.async_set(
         "switch.lamp", "on", {"friendly_name": "Living Room Lamp"}
@@ -1071,14 +1142,14 @@ def test_clean_target_name_without_prefix(hass: HomeAssistant):
 
 
 def test_clean_target_name_equal_to_device_falls_back(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Lamp"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Lamp"}, {}, {}, {})
     sensor.hass = hass
     hass.states.async_set("switch.lamp", "on", {"friendly_name": "Lamp"})
     assert sensor._get_clean_target_name() == "Lamp"
 
 
 def test_icon_reflects_state():
-    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {}, {})
     sensor._state = STATE_DEVICE
     assert sensor.icon == "mdi:gesture-tap"
     sensor._state = "something_unmapped"

@@ -251,16 +251,15 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         device_info: DeviceInfo,
         context_cache: dict[str, dict[str, Any]],
         user_cache: dict[str, dict[str, Any]],
-        command_cache: dict[str, dict[str, Any]] | None = None,
+        command_cache: dict[str, dict[str, Any]],
     ) -> None:
         self._target_entity = target_entity
         self._device_info = device_info
         self._cache = context_cache
         self._user_cache = user_cache
-        # Values HA last commanded per entity, keyed by entity_id. Optional so
-        # the sensor still works (falling back to the time-based guard) if it
-        # is constructed without one.
-        self._command_cache = command_cache if command_cache is not None else {}
+        # Values HA last commanded, keyed by entity_id, shared with the other
+        # sensors and populated by the service listener in __init__.
+        self._command_cache = command_cache
 
         self._attr_translation_placeholders = {
             "target": slug_to_title(target_entity)
@@ -680,9 +679,10 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         """Judge a context-free change against the value HA last commanded.
 
         Returns True when the change is this command playing out, False when it
-        is something else, and None when there is nothing to compare against -
-        no recent command, or the command said nothing about the attributes
-        that changed - in which case the caller falls back to the time guard.
+        is something else, and None when the record cannot settle it - no recent
+        command, or nothing in it worth comparing - in which case the caller
+        falls back to the time guard. Only positive evidence produces a verdict,
+        so a thin record can never override an answer the guard already had.
 
         A report counts as the command's own when it has landed on the
         commanded value (within tolerance) or is still converging on it. The
@@ -726,12 +726,16 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
                 continue  # still moving towards the commanded value
             return False
 
-        if undecided:
-            return None
-        if compared:
+        if compared and not undecided:
             return True
-        # Nothing numeric to compare, but the commanded on/off state matched.
-        return True if want_state is not None else None
+
+        # Either a value fell short of the command with no earlier reading to
+        # judge progress by, or there was nothing numeric to compare at all.
+        # The latter is the common `light.turn_on` carrying neither brightness
+        # nor colour, where the record says only "we asked for on" - a claim
+        # every later report of a lit light satisfies, including a manual dim
+        # long after the command. Too weak to rule on, so defer to the guard.
+        return None
 
     def _build_cache_debug(self) -> dict[str, Any]:
         """Build a diagnostic snapshot focused on the last classification."""

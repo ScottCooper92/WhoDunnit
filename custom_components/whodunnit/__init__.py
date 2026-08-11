@@ -66,14 +66,17 @@ def _target_entity_ids(event: Event) -> list[str]:
     Only literal entity_ids are resolved. A call aimed at an area, device, or
     label carries no entity_id here, and expanding those would mean walking the
     registries on every service call in the system; the sensor simply falls
-    back to its time-based echo guard when no value was recorded.
+    back to its time-based echo guard when no value was recorded. The `all`
+    target is likewise not expanded - it is recorded under that literal key,
+    which no sensor ever reads, so it too falls back rather than misleads.
     """
     for source in (event.data.get("target"), event.data.get("service_data")):
         if not isinstance(source, dict):
             continue
         raw = source.get("entity_id")
         if isinstance(raw, str):
-            return [raw]
+            # A single string may still carry several ids, comma separated.
+            return [e.strip() for e in raw.split(",") if e.strip()]
         if isinstance(raw, list):
             return [e for e in raw if isinstance(e, str)]
     return []
@@ -181,15 +184,25 @@ def _setup_shared_listeners(hass: HomeAssistant) -> None:
         # that is following that command from one that is not. Independent of
         # the source classification below: the command matters whoever issued
         # it, and an automation, a script and a dashboard tap all echo alike.
-        if domain == "light" and service in ("turn_on", "turn_off"):
+        if domain == "light":
             targets = _target_entity_ids(event)
-            if targets:
+            if targets and service in ("turn_on", "turn_off"):
                 values = _commanded_light_values(
                     service, event.data.get("service_data") or {}
                 )
                 stamp = time.monotonic()
                 for entity_id in targets:
                     command_cache[entity_id] = {**values, "timestamp": stamp}
+            elif targets:
+                # Any other light service changes the light without telling us
+                # what it asked for - `toggle` above all. Drop the record
+                # instead of letting it outlive the command it described: a
+                # stale "we asked for on" would rule the echo of a toggle-off a
+                # manual press, which is the false signal this guard exists to
+                # avoid. With nothing recorded the time guard decides, and it
+                # gets this case right.
+                for entity_id in targets:
+                    command_cache.pop(entity_id, None)
 
         if domain in ("automation", "script", "scene"):
             service_data = event.data.get("service_data", {})
