@@ -119,12 +119,39 @@ ATTRIBUTE_CHANGE_THROTTLE = 2.0
 # transition runs. Those reports carry no context, so without a guard they are
 # indistinguishable from a genuine physical press and classify as STATE_DEVICE
 # at high confidence, firing false "manual" signals on the automation's own
-# echo. When a context-free change lands within this many seconds of the last
-# HA-originated command to the same entity, it is treated as a probable echo
-# and reported at CONFIDENCE_LOW (mirroring the ESPHome bleed handling), so a
-# consumer can filter it out while a real press - one with no recent command -
-# still reports high. Sized to cover a typical light transition (<= a few s).
+# echo. A context-free change inside the guard window is reported at
+# CONFIDENCE_LOW (mirroring the ESPHome bleed handling), so a consumer can
+# filter it out while a real press - one with no recent command - still
+# reports high.
+#
+# Two clocks bound the window, because a report is rarely a single echo:
+# a Matter light streams one report per step for as long as it is moving.
+#
+#   COMMAND_ECHO_WINDOW     - the gap allowed since the last command OR the
+#                             last echo. Bridges consecutive reports in one
+#                             train, and closes shortly after the train stops,
+#                             so a device that does not echo at all (Zigbee,
+#                             most local push) re-arms almost immediately.
+#   COMMAND_ECHO_MAX_WINDOW - a hard ceiling measured from the command itself,
+#                             so a chain can never extend the window forever.
+#
+# Sizing comes from measurements against real Matter lights (HA 2026.7):
+# reports arrive ~2 s apart (python-matter-server pins a 1 s subscription
+# floor); an ordinary on/dim command produces a train ending 2.5-8.3 s after
+# the command; a large fade on a bulb that ignores the requested transition
+# time ran 22.5 s. 8 s comfortably bridges the ~2 s spacing, and 30 s clears
+# the worst observed train with margin.
+#
+# Note HA core already covers the first few seconds by itself: Entity keeps
+# the command's Context for CONTEXT_RECENT_TIME_SECONDS (5 s) and reuses it,
+# so early reports inherit it and never reach Step 4. This guard exists for
+# the reports that outlive that retention.
+#
+# Known trade-off: a genuine press during an active echo train reads low.
+# That is deliberate - a false "manual" reading disables the automation that
+# owns the light, which is far more disruptive than a missed press.
 COMMAND_ECHO_WINDOW = 8.0
+COMMAND_ECHO_MAX_WINDOW = 30.0
 
 # All valid sensor state slugs, used for restored-state validation.
 VALID_STATES = frozenset({

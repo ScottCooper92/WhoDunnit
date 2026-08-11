@@ -20,6 +20,7 @@ from custom_components.whodunnit.const import (
     ATTR_SOURCE_NAME,
     ATTR_SOURCE_TYPE,
     ATTR_USER_ID,
+    COMMAND_ECHO_MAX_WINDOW,
     COMMAND_ECHO_WINDOW,
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
@@ -378,12 +379,14 @@ async def test_echo_after_command_is_low_end_to_end(
 async def test_device_echo_does_not_refresh_command_window(
     hass: HomeAssistant, make_config_entry, register_target
 ):
-    """An echo must not extend the guard window: only HA commands arm it.
+    """Only HA commands arm _last_command_time; echoes never touch it.
 
-    A Matter transition streams several context-free echoes; if each one
-    refreshed _last_command_time, an echo chain would keep its own window
-    open indefinitely and a genuine press long after the command would still
-    read low. Device classifications must leave the recorded time untouched.
+    A Matter transition streams several context-free echoes, and each one does
+    extend the guard (via the separate _last_echo_time chain) so the whole
+    train is covered. What must not happen is an echo moving the *command*
+    timestamp: that is the anchor for COMMAND_ECHO_MAX_WINDOW, and if a chain
+    could push it forward the ceiling would slide and the window could stay
+    open indefinitely. Keeping the two clocks separate is what bounds it.
     """
     _, sid = await _setup_sensor(
         hass, make_config_entry, register_target,
@@ -412,6 +415,90 @@ async def test_device_echo_does_not_refresh_command_window(
     await _fire(hass, "light.matter", "off", context=Context())
     assert _attrs(hass, sid)[ATTR_CONFIDENCE] == CONFIDENCE_LOW
     assert sensor._last_command_time == armed_at
+
+
+async def test_echo_chain_bridges_consecutive_reports():
+    """A train keeps the guard open past the command's own window.
+
+    Reports arrive ~2s apart and can run well beyond COMMAND_ECHO_WINDOW from
+    the command; each echo extends the chain so the whole train reads low.
+    """
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    now = time.monotonic()
+    # Command is older than the gap window, but a report landed 2s ago.
+    sensor._last_command_time = now - (COMMAND_ECHO_WINDOW + 4)
+    sensor._last_echo_time = now - 2.0
+
+    result = await sensor._async_classify(Context(), now)
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_LOW
+    assert result.is_echo is True
+
+
+async def test_echo_chain_cannot_outlive_max_window():
+    """The ceiling wins even while a chain is still being extended."""
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    now = time.monotonic()
+    sensor._last_command_time = now - (COMMAND_ECHO_MAX_WINDOW + 1)
+    sensor._last_echo_time = now - 2.0  # chain still live
+
+    result = await sensor._async_classify(Context(), now)
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_HIGH
+    assert result.is_echo is False
+
+
+async def test_echo_chain_closes_once_reports_stop():
+    """Once the train goes quiet the guard re-arms, well inside the ceiling."""
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    now = time.monotonic()
+    sensor._last_command_time = now - 20.0  # still under the 30s ceiling
+    sensor._last_echo_time = now - (COMMAND_ECHO_WINDOW + 1)
+
+    result = await sensor._async_classify(Context(), now)
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_HIGH
+
+
+async def test_new_command_resets_the_echo_chain(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A fresh command starts a fresh train rather than inheriting the old one."""
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter", state="off",
+    )
+    cache = hass.data[DOMAIN]["context_cache"]
+
+    def _command(ctx):
+        cache[ctx.id] = {
+            "id": "automation.dim",
+            "name": "Dim",
+            "type": STATE_AUTOMATION,
+            "timestamp": time.monotonic(),
+        }
+
+    ctx = Context()
+    _command(ctx)
+    await _fire(hass, "light.matter", "on", context=ctx)
+    await _fire(hass, "light.matter", "off", context=Context())  # echo
+
+    sensor = next(
+        p.entities[sid]
+        for p in entity_platform.async_get_platforms(hass, DOMAIN)
+        if sid in p.entities
+    )
+    assert sensor._last_echo_time > 0.0  # the chain is live
+
+    ctx2 = Context()
+    _command(ctx2)
+    await _fire(hass, "light.matter", "on", context=ctx2)
+
+    assert hass.states.get(sid).state == STATE_AUTOMATION
+    assert sensor._last_echo_time == 0.0  # chain cleared by the new command
 
 
 # --------------------------------------------------------------------------- #
