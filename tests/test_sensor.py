@@ -1,7 +1,9 @@
 """Tests for the WhodunnitSensor detection cascade and lifecycle."""
 
+import itertools
 import time
 
+from homeassistant.const import EVENT_CALL_SERVICE
 from homeassistant.core import Context, HomeAssistant, State
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers import entity_registry as er
@@ -311,7 +313,7 @@ async def test_bleed_platform_downgrades_repeat_ui_hit(
 
 async def test_echo_guard_downgrades_change_soon_after_command():
     """A context-free change within the echo window of a command is low."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - 1.0  # HA commanded this entity 1s ago
 
@@ -323,7 +325,7 @@ async def test_echo_guard_downgrades_change_soon_after_command():
 
 async def test_echo_guard_allows_genuine_press_after_window():
     """A context-free change once the window has passed is a real press (high)."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - (COMMAND_ECHO_WINDOW + 1)
 
@@ -335,7 +337,7 @@ async def test_echo_guard_allows_genuine_press_after_window():
 
 async def test_echo_guard_high_when_no_prior_command():
     """With no command ever recorded, a device change is a genuine press."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
 
     result = await sensor._async_classify(Context(), time.monotonic())
 
@@ -423,7 +425,7 @@ async def test_echo_chain_bridges_consecutive_reports():
     Reports arrive ~2s apart and can run well beyond COMMAND_ECHO_WINDOW from
     the command; each echo extends the chain so the whole train reads low.
     """
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     # Command is older than the gap window, but a report landed 2s ago.
     sensor._last_command_time = now - (COMMAND_ECHO_WINDOW + 4)
@@ -438,7 +440,7 @@ async def test_echo_chain_bridges_consecutive_reports():
 
 async def test_echo_chain_cannot_outlive_max_window():
     """The ceiling wins even while a chain is still being extended."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - (COMMAND_ECHO_MAX_WINDOW + 1)
     sensor._last_echo_time = now - 2.0  # chain still live
@@ -452,7 +454,7 @@ async def test_echo_chain_cannot_outlive_max_window():
 
 async def test_echo_chain_closes_once_reports_stop():
     """Once the train goes quiet the guard re-arms, well inside the ceiling."""
-    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
     now = time.monotonic()
     sensor._last_command_time = now - 20.0  # still under the 30s ceiling
     sensor._last_echo_time = now - (COMMAND_ECHO_WINDOW + 1)
@@ -461,6 +463,485 @@ async def test_echo_chain_closes_once_reports_stop():
 
     assert result.state == STATE_DEVICE
     assert result.confidence == CONFIDENCE_HIGH
+
+
+# --------------------------------------------------------------------------- #
+# Command-value matching
+# --------------------------------------------------------------------------- #
+
+
+def _sensor_with_command(**command):
+    """A sensor whose target was just commanded to the given values."""
+    cache = {}
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, cache)
+    cache["light.matter"] = {
+        "state": "on",
+        "brightness": None,
+        "color_temp_kelvin": None,
+        "timestamp": time.monotonic(),
+        **command,
+    }
+    return sensor
+
+
+def _light_state(brightness=None, state="on", color_temp_kelvin=None):
+    attrs = {}
+    if brightness is not None:
+        attrs["brightness"] = brightness
+    if color_temp_kelvin is not None:
+        attrs["color_temp_kelvin"] = color_temp_kelvin
+    return State("light.matter", state, attrs)
+
+
+def test_command_match_landed_on_commanded_value():
+    """A report sitting on the commanded value is that command's echo."""
+    sensor = _sensor_with_command(brightness=200)
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(brightness=195), _light_state(brightness=10)
+    )
+    assert verdict is True
+
+
+def test_command_match_accepts_a_converging_fade_step():
+    """A mid-fade step is far from the target but heading for it -> echo.
+
+    The step below is 120 away from the commanded 200, well outside tolerance;
+    it only counts as an echo because it is closer than the previous report.
+    """
+    sensor = _sensor_with_command(brightness=200)
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(brightness=80), _light_state(brightness=10)
+    )
+    assert verdict is True
+
+
+def test_command_match_rejects_a_change_moving_away():
+    """A report heading away from the commanded value is somebody else."""
+    sensor = _sensor_with_command(brightness=200)
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(brightness=40), _light_state(brightness=90)
+    )
+    assert verdict is False
+
+
+def test_command_match_rejects_wrong_on_off_state():
+    """Commanded on, reported off - not this command arriving."""
+    sensor = _sensor_with_command(brightness=200)
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(state="off"), _light_state(brightness=200)
+    )
+    assert verdict is False
+
+
+def test_command_match_ignores_a_stale_command():
+    """Past the echo ceiling the recorded command is no longer relevant."""
+    sensor = _sensor_with_command(brightness=200)
+    sensor._command_cache["light.matter"]["timestamp"] -= COMMAND_ECHO_MAX_WINDOW + 1
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(brightness=200), _light_state(brightness=10)
+    )
+    assert verdict is None
+
+
+def test_command_match_none_without_a_recorded_command():
+    """With nothing recorded the caller falls back to the time guard."""
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, {})
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(brightness=200), None
+    )
+    assert verdict is None
+
+
+async def test_plain_turn_on_does_not_swallow_a_later_press():
+    """A record of nothing but "we asked for on" is too thin to rule on.
+
+    `light.turn_on` with neither brightness nor colour is the most common light
+    call there is, and every later report of a lit light satisfies it - a manual
+    dim included. Judging that a match would swallow presses for the whole
+    ceiling, so the value comparison must abstain and let the guard answer.
+    """
+    sensor = _sensor_with_command()  # state on, nothing numeric recorded
+    now = time.monotonic()
+    sensor._last_command_time = now - 20.0  # any train is long over
+
+    verdict = sensor._command_echo_verdict(
+        now, _light_state(brightness=30), _light_state(brightness=200)
+    )
+    assert verdict is None
+
+    result = await sensor._async_classify(Context(), now, verdict)
+    assert result.confidence == CONFIDENCE_HIGH
+
+
+async def test_toggle_evicts_the_stale_command_record(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """An unhandled light service must not leave a record asserting the opposite.
+
+    `light.toggle` turns the light off while the cache still says "we asked for
+    on", so the toggle's own echo would be ruled a manual press - the false
+    signal the guard exists to avoid. Evicting leaves the guard to decide.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter",
+        state="on", attributes={"brightness": 200},
+    )
+    command_cache = hass.data[DOMAIN]["command_cache"]
+
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness": 250},
+        },
+    )
+    await hass.async_block_till_done()
+    assert "light.matter" in command_cache
+
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "toggle",
+            "service_data": {"entity_id": "light.matter"},
+        },
+    )
+    await hass.async_block_till_done()
+    assert "light.matter" not in command_cache
+
+    # With the record gone, the toggle's echo cannot be ruled a person.
+    sensor = next(
+        p.entities[sid]
+        for p in entity_platform.async_get_platforms(hass, DOMAIN)
+        if sid in p.entities
+    )
+    verdict = sensor._command_echo_verdict(
+        time.monotonic(), _light_state(state="off"), _light_state(brightness=200)
+    )
+    assert verdict is None
+
+
+async def test_command_match_overrides_the_time_guard_mid_train():
+    """A press during a live echo train still reads high.
+
+    This is the case timing alone cannot reach: the chain is active, so the
+    windows would say echo, but the value says somebody moved the light
+    somewhere the command never asked for.
+    """
+    sensor = _sensor_with_command(brightness=200)
+    now = time.monotonic()
+    sensor._last_command_time = now - 1.0
+    sensor._last_echo_time = now - 2.0  # a train is running
+
+    result = await sensor._async_classify(Context(), now, echo_verdict=False)
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_HIGH
+    assert result.is_echo is False
+
+
+async def test_command_match_marks_echo_outside_the_time_windows():
+    """Conversely, a confirmed echo reads low even past the windows."""
+    sensor = _sensor_with_command(brightness=200)
+    now = time.monotonic()
+    # No command recorded on the timing clocks at all.
+    result = await sensor._async_classify(Context(), now, echo_verdict=True)
+
+    assert result.state == STATE_DEVICE
+    assert result.confidence == CONFIDENCE_LOW
+    assert result.is_echo is True
+
+
+async def test_light_command_is_recorded_and_matched_end_to_end(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """The real listener records the command; the sensor matches a report to it.
+
+    Covers the whole path: EVENT_CALL_SERVICE -> command_cache (with
+    brightness_pct converted to the 0-255 scale) -> a context-free report that
+    lands on the commanded value being classified as that command's echo.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter",
+        state="on", attributes={"brightness": 10},
+    )
+
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness_pct": 100},
+        },
+    )
+    await hass.async_block_till_done()
+
+    recorded = hass.data[DOMAIN]["command_cache"]["light.matter"]
+    assert recorded["brightness"] == 255  # 100% converted to the reported scale
+    assert recorded["state"] == "on"
+
+    # The Matter node reports the achieved level with no context of its own.
+    await _fire(
+        hass, "light.matter", "on", context=Context(), attributes={"brightness": 254}
+    )
+
+    state = hass.states.get(sid)
+    assert state.state == STATE_DEVICE
+    assert state.attributes[ATTR_CONFIDENCE] == CONFIDENCE_LOW
+
+
+async def _command_then_report(
+    hass, make_config_entry, register_target, *, was, commanded, reported
+):
+    """Register a light at `was`, command it to `commanded`, report `reported`.
+
+    One report per test: two attribute-only changes in a row would hit the 2s
+    ATTRIBUTE_CHANGE_THROTTLE and the second would never be classified.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter",
+        state="on", attributes={"brightness": was},
+    )
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness": commanded},
+        },
+    )
+    await hass.async_block_till_done()
+    await _fire(
+        hass, "light.matter", "on",
+        context=Context(), attributes={"brightness": reported},
+    )
+    return sid
+
+
+async def test_fade_step_towards_the_commanded_value_is_an_echo(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """120 is nowhere near the commanded 250, but it is closer than 10 was."""
+    sid = await _command_then_report(
+        hass, make_config_entry, register_target,
+        was=10, commanded=250, reported=120,
+    )
+    assert _attrs(hass, sid)[ATTR_CONFIDENCE] == CONFIDENCE_LOW
+
+
+async def test_press_during_a_fade_is_not_swallowed(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """Somebody dimming a light mid-fade reads high, not low.
+
+    The regression this whole mechanism exists for: the time guard alone would
+    call anything arriving while the train is running an echo.
+    """
+    sid = await _command_then_report(
+        hass, make_config_entry, register_target,
+        was=90, commanded=250, reported=30,
+    )
+    state = hass.states.get(sid)
+    assert state.state == STATE_DEVICE
+    assert state.attributes[ATTR_CONFIDENCE] == CONFIDENCE_HIGH
+
+
+def _sensor_of(hass, sid):
+    return next(
+        p.entities[sid]
+        for p in entity_platform.async_get_platforms(hass, DOMAIN)
+        if sid in p.entities
+    )
+
+
+async def test_command_keeps_its_own_record(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A command's own state change must not evict the record it just wrote.
+
+    The record is written on EVENT_CALL_SERVICE, before the change it causes,
+    and both carry the same context - which is exactly how the record is told
+    apart from a superseded one. If this regressed, command matching would
+    silently never apply to anything.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter", state="off",
+    )
+    command_cache = hass.data[DOMAIN]["command_cache"]
+
+    own = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness": 250},
+        },
+        context=own,
+    )
+    await hass.async_block_till_done()
+
+    hass.data[DOMAIN]["context_cache"][own.id] = {
+        "id": "automation.dim", "name": "Dim",
+        "type": STATE_AUTOMATION, "timestamp": time.monotonic(),
+    }
+    await _fire(
+        hass, "light.matter", "on", context=own, attributes={"brightness": 40}
+    )
+
+    assert hass.states.get(sid).state == STATE_AUTOMATION
+    assert command_cache["light.matter"]["brightness"] == 250
+
+
+async def test_area_targeted_command_drops_a_superseded_record(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """An area-targeted call names no entity, so eviction cannot key off it.
+
+    The listener records nothing and evicts nothing for such a call, so the
+    previous record would survive the command that invalidated it and rule
+    that command's own echo a manual press. The sensor sees the state change
+    whatever the call targeted, so it drops the record there instead.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter",
+        state="on", attributes={"brightness": 200},
+    )
+    command_cache = hass.data[DOMAIN]["command_cache"]
+
+    own = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness": 250},
+        },
+        context=own,
+    )
+    await hass.async_block_till_done()
+    assert command_cache["light.matter"]["context_id"] == own.id
+
+    # "Turn the lights off in here" - no entity_id, so nothing is recorded
+    # and the stale record is still sitting there.
+    other = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_off",
+            "target": {"area_id": "kitchen"},
+        },
+        context=other,
+    )
+    await hass.async_block_till_done()
+    assert "light.matter" in command_cache
+
+    # HA drives the light off under that call's context.
+    hass.data[DOMAIN]["context_cache"][other.id] = {
+        "id": "automation.away", "name": "Away",
+        "type": STATE_AUTOMATION, "timestamp": time.monotonic(),
+    }
+    await _fire(hass, "light.matter", "off", context=other)
+
+    assert hass.states.get(sid).state == STATE_AUTOMATION
+    assert "light.matter" not in command_cache
+
+    # So the echo behind it cannot be ruled a person.
+    sensor = _sensor_of(hass, sid)
+    assert sensor._command_echo_verdict(
+        time.monotonic(), _light_state(state="off"), _light_state(brightness=200)
+    ) is None
+
+
+def test_verdict_rules_only_on_evidence():
+    """Property: a ruling needs evidence, and on/off agreement is not evidence.
+
+    Both regressions found in review had the same shape - a verdict invented
+    from the *absence of contradicting* evidence rather than the *presence of
+    supporting* evidence. Rather than pin the two known cases, this sweeps the
+    grid of commanded and reported values and asserts the underlying rule, so
+    an attribute added to the comparison later inherits it.
+
+    Deliberately does not re-derive what the verdict should be; that would
+    just mirror the implementation. It only constrains when the method is
+    entitled to answer at all.
+    """
+    numeric_keys = ("brightness", "color_temp_kelvin")
+    states = ("on", "off")
+    brightnesses = (None, 10, 120, 250)
+    kelvins = (None, 2700, 5000)
+    previous_brightnesses = (None, 10, 200)
+
+    def _state(state, brightness, kelvin):
+        attrs = {}
+        if brightness is not None:
+            attrs["brightness"] = brightness
+        if kelvin is not None:
+            attrs["color_temp_kelvin"] = kelvin
+        return State("light.matter", state, attrs)
+
+    cache = {}
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, cache)
+    now = time.monotonic()
+    checked = 0
+
+    for (
+        cmd_state, cmd_brightness, cmd_kelvin,
+        rep_state, rep_brightness, rep_kelvin,
+        prev_brightness, stale,
+    ) in itertools.product(
+        states, brightnesses, kelvins,
+        states, brightnesses, kelvins,
+        previous_brightnesses, (False, True),
+    ):
+        command = {
+            "state": cmd_state,
+            "brightness": cmd_brightness,
+            "color_temp_kelvin": cmd_kelvin,
+            "timestamp": now - (
+                COMMAND_ECHO_MAX_WINDOW + 1 if stale else 0.5
+            ),
+        }
+        cache["light.matter"] = command
+        report = _state(rep_state, rep_brightness, rep_kelvin)
+
+        verdict = sensor._command_echo_verdict(
+            now, report, _state("on", prev_brightness, None)
+        )
+        checked += 1
+        case = (
+            f"commanded {cmd_state}/{cmd_brightness}/{cmd_kelvin}, "
+            f"reported {rep_state}/{rep_brightness}/{rep_kelvin}, "
+            f"previous {prev_brightness}, stale={stale}"
+        )
+
+        if stale:
+            assert verdict is None, f"ruled {verdict} on a stale record: {case}"
+            continue
+
+        contradicts_state = report.state != cmd_state
+        compared_numeric = any(
+            command[key] is not None and report.attributes.get(key) is not None
+            for key in numeric_keys
+        )
+
+        if verdict is not None:
+            assert contradicts_state or compared_numeric, (
+                f"ruled {verdict} with nothing to go on: {case}"
+            )
+        if verdict is True:
+            assert compared_numeric, (
+                f"called it an echo on on/off agreement alone: {case}"
+            )
+
+    assert checked > 1000, "the grid did not actually run"
 
 
 async def test_new_command_resets_the_echo_chain(
@@ -816,7 +1297,7 @@ async def test_cache_debug_handles_evicted_matched_entry(
 
 
 def test_build_cache_debug_before_any_classification():
-    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {}, {})
     debug = sensor._build_cache_debug()
     assert debug == {
         "last_classification_ago": None,
@@ -826,7 +1307,7 @@ def test_build_cache_debug_before_any_classification():
 
 
 def test_clean_target_name_strips_device_prefix(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {}, {})
     sensor.hass = hass
     hass.states.async_set(
         "switch.lamp", "on", {"friendly_name": "Living Room Lamp"}
@@ -835,7 +1316,7 @@ def test_clean_target_name_strips_device_prefix(hass: HomeAssistant):
 
 
 def test_clean_target_name_prefers_registry_name(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Living Room"}, {}, {}, {})
     sensor.hass = hass
     ent_reg = er.async_get(hass)
     ent_reg.async_get_or_create(
@@ -847,7 +1328,7 @@ def test_clean_target_name_prefers_registry_name(hass: HomeAssistant):
 
 
 def test_clean_target_name_without_prefix(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Garage"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Garage"}, {}, {}, {})
     sensor.hass = hass
     hass.states.async_set(
         "switch.lamp", "on", {"friendly_name": "Living Room Lamp"}
@@ -856,14 +1337,14 @@ def test_clean_target_name_without_prefix(hass: HomeAssistant):
 
 
 def test_clean_target_name_equal_to_device_falls_back(hass: HomeAssistant):
-    sensor = WhodunnitSensor("switch.lamp", {"name": "Lamp"}, {}, {})
+    sensor = WhodunnitSensor("switch.lamp", {"name": "Lamp"}, {}, {}, {})
     sensor.hass = hass
     hass.states.async_set("switch.lamp", "on", {"friendly_name": "Lamp"})
     assert sensor._get_clean_target_name() == "Lamp"
 
 
 def test_icon_reflects_state():
-    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {})
+    sensor = WhodunnitSensor("switch.test", {"name": "Dev"}, {}, {}, {})
     sensor._state = STATE_DEVICE
     assert sensor.icon == "mdi:gesture-tap"
     sensor._state = "something_unmapped"

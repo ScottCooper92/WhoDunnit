@@ -24,8 +24,10 @@ Responsibilities:
 
 import logging
 import time
+from typing import Any
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_CALL_SERVICE
+from homeassistant.const import EVENT_CALL_SERVICE, STATE_OFF, STATE_ON
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er, device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -41,6 +43,7 @@ from .const import (
     CACHE_TTL,
     CACHE_MAX_SIZE,
     CACHE_CLEANUP_INTERVAL,
+    COMMAND_ECHO_MAX_WINDOW,
 )
 from .util import entry_unique_id, sensor_unique_id, slug_to_title
 
@@ -57,6 +60,55 @@ def _get_friendly(hass: HomeAssistant, entity_id: str) -> str:
     )
 
 
+def _target_entity_ids(event: Event) -> list[str]:
+    """Return the entity_ids a service call explicitly targeted.
+
+    Only literal entity_ids are resolved. A call aimed at an area, device, or
+    label carries no entity_id here, and expanding those would mean walking the
+    registries on every service call in the system; the sensor simply falls
+    back to its time-based echo guard when no value was recorded. The `all`
+    target is likewise not expanded - it is recorded under that literal key,
+    which no sensor ever reads, so it too falls back rather than misleads.
+    """
+    for source in (event.data.get("target"), event.data.get("service_data")):
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("entity_id")
+        if isinstance(raw, str):
+            # A single string may still carry several ids, comma separated.
+            return [e.strip() for e in raw.split(",") if e.strip()]
+        if isinstance(raw, list):
+            return [e for e in raw if isinstance(e, str)]
+    return []
+
+
+def _commanded_light_values(
+    service: str, service_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Normalise a light service call to the attributes the entity reports back.
+
+    brightness_pct is converted to the 0-255 scale so it can be compared with
+    the reported brightness directly. Colour is limited to colour temperature:
+    the RGB/HS/XY representations convert between each other lossily, and a
+    light frequently reports back in a different colour mode than the one it
+    was commanded in, which would produce false mismatches.
+    """
+    if service == "turn_off":
+        return {"state": STATE_OFF, "brightness": None, "color_temp_kelvin": None}
+
+    brightness = service_data.get("brightness")
+    if brightness is None and service_data.get("brightness_pct") is not None:
+        # Same expression the light component uses, so this lands on the exact
+        # value the entity will be asked for rather than one off it.
+        brightness = round(255 * service_data["brightness_pct"] / 100)
+
+    return {
+        "state": STATE_ON,
+        "brightness": brightness,
+        "color_temp_kelvin": service_data.get("color_temp_kelvin"),
+    }
+
+
 def _setup_shared_listeners(hass: HomeAssistant) -> None:
     """Register global event listeners that populate the shared context cache.
 
@@ -69,6 +121,7 @@ def _setup_shared_listeners(hass: HomeAssistant) -> None:
     clock.
     """
     cache = hass.data[DOMAIN]["context_cache"]
+    command_cache = hass.data[DOMAIN]["command_cache"]
     cleanup_state = {"last_time": 0.0}
 
     def _cleanup_cache() -> None:
@@ -82,6 +135,15 @@ def _setup_shared_listeners(hass: HomeAssistant) -> None:
         ]
         for k in expired:
             cache.pop(k, None)
+        # Commanded values are only consulted inside the echo ceiling, so they
+        # can be dropped far sooner than the context entries. One entry per
+        # commanded entity, so this is naturally bounded by the light count.
+        stale_commands = [
+            k for k, v in command_cache.items()
+            if now - v.get("timestamp", 0) > COMMAND_ECHO_MAX_WINDOW
+        ]
+        for k in stale_commands:
+            command_cache.pop(k, None)
         if len(cache) > CACHE_MAX_SIZE:
             sorted_keys = sorted(
                 cache, key=lambda k: cache[k].get("timestamp", 0)
@@ -117,6 +179,36 @@ def _setup_shared_listeners(hass: HomeAssistant) -> None:
         # Defensive guard: bus events always carry a context (see above).
         if not ctx:  # pragma: no cover
             return
+
+        # Record what HA asked the light to do, so a sensor can tell a report
+        # that is following that command from one that is not. Independent of
+        # the source classification below: the command matters whoever issued
+        # it, and an automation, a script and a dashboard tap all echo alike.
+        if domain == "light":
+            targets = _target_entity_ids(event)
+            if targets and service in ("turn_on", "turn_off"):
+                values = _commanded_light_values(
+                    service, event.data.get("service_data") or {}
+                )
+                stamp = time.monotonic()
+                for entity_id in targets:
+                    # context_id lets a sensor recognise the state change this
+                    # very call produces, and so tell its own record from one
+                    # left behind by an earlier command. See
+                    # WhodunnitSensor._drop_superseded_command.
+                    command_cache[entity_id] = {
+                        **values, "timestamp": stamp, "context_id": ctx.id
+                    }
+            elif targets:
+                # Any other light service changes the light without telling us
+                # what it asked for - `toggle` above all. Drop the record
+                # instead of letting it outlive the command it described: a
+                # stale "we asked for on" would rule the echo of a toggle-off a
+                # manual press, which is the false signal this guard exists to
+                # avoid. With nothing recorded the time guard decides, and it
+                # gets this case right.
+                for entity_id in targets:
+                    command_cache.pop(entity_id, None)
 
         if domain in ("automation", "script", "scene"):
             service_data = event.data.get("service_data", {})
@@ -172,6 +264,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if "context_cache" not in hass.data[DOMAIN]:
         hass.data[DOMAIN]["context_cache"] = {}
         hass.data[DOMAIN]["user_cache"] = {}
+        hass.data[DOMAIN]["command_cache"] = {}
         hass.data[DOMAIN]["entries"] = {}
         _setup_shared_listeners(hass)
 
@@ -311,6 +404,7 @@ def _teardown_shared_if_unused(hass: HomeAssistant) -> None:
         unsub()
     domain_data.pop("context_cache", None)
     domain_data.pop("user_cache", None)
+    domain_data.pop("command_cache", None)
     domain_data.pop("entries", None)
 
 
