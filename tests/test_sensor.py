@@ -1,5 +1,6 @@
 """Tests for the WhodunnitSensor detection cascade and lifecycle."""
 
+import itertools
 import time
 
 from homeassistant.const import EVENT_CALL_SERVICE
@@ -747,6 +748,90 @@ async def test_press_during_a_fade_is_not_swallowed(
     state = hass.states.get(sid)
     assert state.state == STATE_DEVICE
     assert state.attributes[ATTR_CONFIDENCE] == CONFIDENCE_HIGH
+
+
+def test_verdict_rules_only_on_evidence():
+    """Property: a ruling needs evidence, and on/off agreement is not evidence.
+
+    Both regressions found in review had the same shape - a verdict invented
+    from the *absence of contradicting* evidence rather than the *presence of
+    supporting* evidence. Rather than pin the two known cases, this sweeps the
+    grid of commanded and reported values and asserts the underlying rule, so
+    an attribute added to the comparison later inherits it.
+
+    Deliberately does not re-derive what the verdict should be; that would
+    just mirror the implementation. It only constrains when the method is
+    entitled to answer at all.
+    """
+    numeric_keys = ("brightness", "color_temp_kelvin")
+    states = ("on", "off")
+    brightnesses = (None, 10, 120, 250)
+    kelvins = (None, 2700, 5000)
+    previous_brightnesses = (None, 10, 200)
+
+    def _state(state, brightness, kelvin):
+        attrs = {}
+        if brightness is not None:
+            attrs["brightness"] = brightness
+        if kelvin is not None:
+            attrs["color_temp_kelvin"] = kelvin
+        return State("light.matter", state, attrs)
+
+    cache = {}
+    sensor = WhodunnitSensor("light.matter", {"name": "Dev"}, {}, {}, cache)
+    now = time.monotonic()
+    checked = 0
+
+    for (
+        cmd_state, cmd_brightness, cmd_kelvin,
+        rep_state, rep_brightness, rep_kelvin,
+        prev_brightness, stale,
+    ) in itertools.product(
+        states, brightnesses, kelvins,
+        states, brightnesses, kelvins,
+        previous_brightnesses, (False, True),
+    ):
+        command = {
+            "state": cmd_state,
+            "brightness": cmd_brightness,
+            "color_temp_kelvin": cmd_kelvin,
+            "timestamp": now - (
+                COMMAND_ECHO_MAX_WINDOW + 1 if stale else 0.5
+            ),
+        }
+        cache["light.matter"] = command
+        report = _state(rep_state, rep_brightness, rep_kelvin)
+
+        verdict = sensor._command_echo_verdict(
+            now, report, _state("on", prev_brightness, None)
+        )
+        checked += 1
+        case = (
+            f"commanded {cmd_state}/{cmd_brightness}/{cmd_kelvin}, "
+            f"reported {rep_state}/{rep_brightness}/{rep_kelvin}, "
+            f"previous {prev_brightness}, stale={stale}"
+        )
+
+        if stale:
+            assert verdict is None, f"ruled {verdict} on a stale record: {case}"
+            continue
+
+        contradicts_state = report.state != cmd_state
+        compared_numeric = any(
+            command[key] is not None and report.attributes.get(key) is not None
+            for key in numeric_keys
+        )
+
+        if verdict is not None:
+            assert contradicts_state or compared_numeric, (
+                f"ruled {verdict} with nothing to go on: {case}"
+            )
+        if verdict is True:
+            assert compared_numeric, (
+                f"called it an echo on on/off agreement alone: {case}"
+            )
+
+    assert checked > 1000, "the grid did not actually run"
 
 
 async def test_new_command_resets_the_echo_chain(
