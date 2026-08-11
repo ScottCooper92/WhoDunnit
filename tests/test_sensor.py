@@ -750,6 +750,116 @@ async def test_press_during_a_fade_is_not_swallowed(
     assert state.attributes[ATTR_CONFIDENCE] == CONFIDENCE_HIGH
 
 
+def _sensor_of(hass, sid):
+    return next(
+        p.entities[sid]
+        for p in entity_platform.async_get_platforms(hass, DOMAIN)
+        if sid in p.entities
+    )
+
+
+async def test_command_keeps_its_own_record(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """A command's own state change must not evict the record it just wrote.
+
+    The record is written on EVENT_CALL_SERVICE, before the change it causes,
+    and both carry the same context - which is exactly how the record is told
+    apart from a superseded one. If this regressed, command matching would
+    silently never apply to anything.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter", state="off",
+    )
+    command_cache = hass.data[DOMAIN]["command_cache"]
+
+    own = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness": 250},
+        },
+        context=own,
+    )
+    await hass.async_block_till_done()
+
+    hass.data[DOMAIN]["context_cache"][own.id] = {
+        "id": "automation.dim", "name": "Dim",
+        "type": STATE_AUTOMATION, "timestamp": time.monotonic(),
+    }
+    await _fire(
+        hass, "light.matter", "on", context=own, attributes={"brightness": 40}
+    )
+
+    assert hass.states.get(sid).state == STATE_AUTOMATION
+    assert command_cache["light.matter"]["brightness"] == 250
+
+
+async def test_area_targeted_command_drops_a_superseded_record(
+    hass: HomeAssistant, make_config_entry, register_target
+):
+    """An area-targeted call names no entity, so eviction cannot key off it.
+
+    The listener records nothing and evicts nothing for such a call, so the
+    previous record would survive the command that invalidated it and rule
+    that command's own echo a manual press. The sensor sees the state change
+    whatever the call targeted, so it drops the record there instead.
+    """
+    _, sid = await _setup_sensor(
+        hass, make_config_entry, register_target,
+        target="light.matter", platform="matter",
+        state="on", attributes={"brightness": 200},
+    )
+    command_cache = hass.data[DOMAIN]["command_cache"]
+
+    own = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_on",
+            "service_data": {"entity_id": "light.matter", "brightness": 250},
+        },
+        context=own,
+    )
+    await hass.async_block_till_done()
+    assert command_cache["light.matter"]["context_id"] == own.id
+
+    # "Turn the lights off in here" - no entity_id, so nothing is recorded
+    # and the stale record is still sitting there.
+    other = Context()
+    hass.bus.async_fire(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": "light",
+            "service": "turn_off",
+            "target": {"area_id": "kitchen"},
+        },
+        context=other,
+    )
+    await hass.async_block_till_done()
+    assert "light.matter" in command_cache
+
+    # HA drives the light off under that call's context.
+    hass.data[DOMAIN]["context_cache"][other.id] = {
+        "id": "automation.away", "name": "Away",
+        "type": STATE_AUTOMATION, "timestamp": time.monotonic(),
+    }
+    await _fire(hass, "light.matter", "off", context=other)
+
+    assert hass.states.get(sid).state == STATE_AUTOMATION
+    assert "light.matter" not in command_cache
+
+    # So the echo behind it cannot be ruled a person.
+    sensor = _sensor_of(hass, sid)
+    assert sensor._command_echo_verdict(
+        time.monotonic(), _light_state(state="off"), _light_state(brightness=200)
+    ) is None
+
+
 def test_verdict_rules_only_on_evidence():
     """Property: a ruling needs evidence, and on/off agreement is not evidence.
 

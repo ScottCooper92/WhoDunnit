@@ -192,7 +192,13 @@ def _setup_shared_listeners(hass: HomeAssistant) -> None:
                 )
                 stamp = time.monotonic()
                 for entity_id in targets:
-                    command_cache[entity_id] = {**values, "timestamp": stamp}
+                    # context_id lets a sensor recognise the state change this
+                    # very call produces, and so tell its own record from one
+                    # left behind by an earlier command. See
+                    # WhodunnitSensor._drop_superseded_command.
+                    command_cache[entity_id] = {
+                        **values, "timestamp": stamp, "context_id": ctx.id
+                    }
             elif targets:
                 # Any other light service changes the light without telling us
                 # what it asked for - `toggle` above all. Drop the record

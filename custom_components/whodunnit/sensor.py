@@ -511,6 +511,7 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             if result.state not in (STATE_DEVICE, STATE_MONITORING):
                 self._last_command_time = now
                 self._last_echo_time = 0.0
+                self._drop_superseded_command(ctx)
             elif result.is_echo:
                 self._last_echo_time = now
 
@@ -672,6 +673,33 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             matched_context_id=None,
             is_echo=is_echo,
         )
+
+    def _drop_superseded_command(self, ctx: Context | None) -> None:
+        """Forget a recorded command that a later HA command has overtaken.
+
+        A record is only written when the call named entity_ids. A call aimed
+        at an area, device or label writes nothing, so without this an older
+        record would survive the very command that invalidated it and then be
+        compared against reports it no longer describes - ruling the new
+        command's own echo a manual press.
+
+        The record carries the context of the call that wrote it, and HA
+        propagates that context to the resulting state change, so a command
+        classification arriving under any other context means the record
+        belongs to an earlier command. Dropping it is always safe: the verdict
+        then returns None and the time guard answers, which is the behaviour
+        this had before command matching existed.
+
+        Matching on context rather than on the reported state also covers the
+        case where the state agrees but the values do not - an area-targeted
+        turn_on to a different brightness leaves the light on, yet the old
+        record would have its reports converging on the wrong target.
+        """
+        cmd = self._command_cache.get(self._target_entity)
+        if not cmd:
+            return
+        if ctx is None or cmd.get("context_id") != ctx.id:
+            self._command_cache.pop(self._target_entity, None)
 
     def _command_echo_verdict(
         self, now: float, new_s: State | None, old_s: State | None
