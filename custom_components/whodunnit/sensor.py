@@ -46,7 +46,11 @@ Detection cascade (in _async_classify):
                                               running: within COMMAND_ECHO_WINDOW of
                                               the command or the previous echo, and
                                               never beyond COMMAND_ECHO_MAX_WINDOW
-                                              from the command itself.
+                                              from the command itself. Where the
+                                              commanded value is known, comparing
+                                              the report against it decides instead,
+                                              which also catches a press made during
+                                              a transition.
 
 After every successful classification, Whodunnit fires a "whodunnit_trigger_detected"
 event on the HA event bus (see EVENT_TRIGGER_DETECTED in const.py). This gives
@@ -65,7 +69,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
-from homeassistant.core import Context, Event, HomeAssistant, callback
+from homeassistant.core import Context, Event, HomeAssistant, State, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
@@ -91,6 +95,8 @@ from .const import (
     ATTRIBUTE_CHANGE_THROTTLE,
     COMMAND_ECHO_MAX_WINDOW,
     COMMAND_ECHO_WINDOW,
+    COMMAND_MATCH_BRIGHTNESS,
+    COMMAND_MATCH_COLOR_TEMP_KELVIN,
     CONFIDENCE_HIGH,
     CONFIDENCE_MEDIUM,
     CONFIDENCE_LOW,
@@ -216,6 +222,7 @@ async def async_setup_entry(
             entry_data["device_info"],
             domain_data["context_cache"],
             domain_data["user_cache"],
+            domain_data["command_cache"],
         )
         for ent in entry_data["targets"]
     ])
@@ -244,11 +251,16 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         device_info: DeviceInfo,
         context_cache: dict[str, dict[str, Any]],
         user_cache: dict[str, dict[str, Any]],
+        command_cache: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._target_entity = target_entity
         self._device_info = device_info
         self._cache = context_cache
         self._user_cache = user_cache
+        # Values HA last commanded per entity, keyed by entity_id. Optional so
+        # the sensor still works (falling back to the time-based guard) if it
+        # is constructed without one.
+        self._command_cache = command_cache if command_cache is not None else {}
 
         self._attr_translation_placeholders = {
             "target": slug_to_title(target_entity)
@@ -466,8 +478,10 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             # realistically raise (it touches hass.auth); the rest is pure
             # cache-dict logic. Scope the catch tightly so a genuine bug is
             # not silently swallowed.
+            echo_verdict = self._command_echo_verdict(now, new_s, old_s)
+
             try:
-                result = await self._async_classify(ctx, now)
+                result = await self._async_classify(ctx, now, echo_verdict)
             except Exception:
                 _LOGGER.exception(
                     "Whodunnit: error classifying %s", self._target_entity
@@ -527,7 +541,10 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             )
 
     async def _async_classify(
-        self, ctx: Context | None, now: float
+        self,
+        ctx: Context | None,
+        now: float,
+        echo_verdict: bool | None = None,
     ) -> _Classification:
         """Decide what triggered the change. No side effects on entity state.
 
@@ -536,7 +553,9 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         auth lookup in steps 1 and 2; everything else is cache-dict logic. The
         shared cache entry's "seen" flag is updated here as part of ESPHome
         bleed detection. ``now`` is the caller's monotonic timestamp for the
-        change, used by the Step 4 command-echo guard.
+        change, used by the Step 4 command-echo guard. ``echo_verdict`` is the
+        command-value comparison's answer when it could reach one, and
+        overrides the guard's timing heuristic in Step 4.
         """
         # Step 1: Direct cache hit on the context ID.
         owner = self._cache.get(ctx.id) if ctx else None
@@ -629,16 +648,22 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
         # genuine press: a context-free change within COMMAND_ECHO_WINDOW of the
         # last HA command to this entity is a probable echo, reported low so a
         # consumer can filter it, while a real press stays high.
-        # A report train is bridged by COMMAND_ECHO_WINDOW (gap since the
-        # command or the previous echo) but can never outlive
-        # COMMAND_ECHO_MAX_WINDOW measured from the command itself.
-        is_echo = (
-            self._last_command_time != 0.0
-            and (now - self._last_command_time) < COMMAND_ECHO_MAX_WINDOW
-            and (
-                now - max(self._last_command_time, self._last_echo_time)
-            ) < COMMAND_ECHO_WINDOW
-        )
+        # Prefer the command-value comparison when it reached an answer: it can
+        # separate a fade step from a press made *during* that fade, which no
+        # amount of timing can. Otherwise fall back to the windows - a report
+        # train is bridged by COMMAND_ECHO_WINDOW (gap since the command or the
+        # previous echo) and can never outlive COMMAND_ECHO_MAX_WINDOW measured
+        # from the command itself.
+        if echo_verdict is not None:
+            is_echo = echo_verdict
+        else:
+            is_echo = (
+                self._last_command_time != 0.0
+                and (now - self._last_command_time) < COMMAND_ECHO_MAX_WINDOW
+                and (
+                    now - max(self._last_command_time, self._last_echo_time)
+                ) < COMMAND_ECHO_WINDOW
+            )
         return _Classification(
             state=STATE_DEVICE,
             source_type=SOURCE_TYPE_DEVICE,
@@ -648,6 +673,65 @@ class WhodunnitSensor(SensorEntity, RestoreEntity):
             matched_context_id=None,
             is_echo=is_echo,
         )
+
+    def _command_echo_verdict(
+        self, now: float, new_s: State | None, old_s: State | None
+    ) -> bool | None:
+        """Judge a context-free change against the value HA last commanded.
+
+        Returns True when the change is this command playing out, False when it
+        is something else, and None when there is nothing to compare against -
+        no recent command, or the command said nothing about the attributes
+        that changed - in which case the caller falls back to the time guard.
+
+        A report counts as the command's own when it has landed on the
+        commanded value (within tolerance) or is still converging on it. The
+        converging case is what makes this usable during a fade, where every
+        intermediate step is legitimately far from the target.
+        """
+        cmd = self._command_cache.get(self._target_entity)
+        if not cmd or new_s is None:
+            return None
+        if (now - cmd.get("timestamp", 0.0)) >= COMMAND_ECHO_MAX_WINDOW:
+            return None
+
+        want_state = cmd.get("state")
+        if want_state is not None and new_s.state != want_state:
+            # Commanded on but reported off (or the reverse): whatever this is,
+            # it is not the commanded change arriving.
+            return False
+
+        compared = False
+        undecided = False
+        for key, tolerance in (
+            ("brightness", COMMAND_MATCH_BRIGHTNESS),
+            ("color_temp_kelvin", COMMAND_MATCH_COLOR_TEMP_KELVIN),
+        ):
+            want = cmd.get(key)
+            got = new_s.attributes.get(key)
+            if want is None or got is None:
+                continue
+            compared = True
+            gap = abs(got - want)
+            if gap <= tolerance:
+                continue
+            previous = old_s.attributes.get(key) if old_s else None
+            if previous is None:
+                # Short of the commanded value with no earlier reading to
+                # measure progress against - the first step of a fade up from
+                # off looks exactly like this. Not evidence either way.
+                undecided = True
+                continue
+            if gap < abs(previous - want):
+                continue  # still moving towards the commanded value
+            return False
+
+        if undecided:
+            return None
+        if compared:
+            return True
+        # Nothing numeric to compare, but the commanded on/off state matched.
+        return True if want_state is not None else None
 
     def _build_cache_debug(self) -> dict[str, Any]:
         """Build a diagnostic snapshot focused on the last classification."""

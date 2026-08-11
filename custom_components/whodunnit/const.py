@@ -153,6 +153,29 @@ ATTRIBUTE_CHANGE_THROTTLE = 2.0
 COMMAND_ECHO_WINDOW = 8.0
 COMMAND_ECHO_MAX_WINDOW = 30.0
 
+# Command-value matching - the refinement that the two windows above cannot
+# make on their own.
+#
+# Timing alone cannot separate "the device is still reporting its way through
+# the transition I asked for" from "somebody pressed the switch while it was
+# moving", because both are context-free changes arriving mid-train. Comparing
+# the report against the value HA actually commanded can: an echo either sits
+# on the commanded value or is heading towards it, while a person's change
+# goes somewhere else entirely.
+#
+# Note that a mid-transition report is legitimately far from the commanded
+# value - a fade to 70% passes through 20%, 40%, 60% on the way - so a plain
+# "differs from the command" test would call every fade step a manual change.
+# The comparison therefore accepts a report that is *converging*: closer to
+# the commanded value than the previous report was. Only a report that lands
+# somewhere else, or moves away, is treated as a person.
+#
+# The tolerances are how close counts as "landed", and cover rounding between
+# percent and the 0-255 scale plus a device's own approximation of what it was
+# asked for. Values follow Adaptive Lighting's long-tuned defaults.
+COMMAND_MATCH_BRIGHTNESS = 25            # of 255 (~10%)
+COMMAND_MATCH_COLOR_TEMP_KELVIN = 100    # kelvin
+
 # All valid sensor state slugs, used for restored-state validation.
 VALID_STATES = frozenset({
     STATE_MONITORING, STATE_AUTOMATION, STATE_DEVICE,
